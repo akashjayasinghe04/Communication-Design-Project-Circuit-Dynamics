@@ -1,69 +1,239 @@
-# SDR LINK v5.3 – messenger + 4 in a Row over two ANTSDR E200s
+# SDR Link 7: encrypted file transfer between two PCs over ANTSDR E200s
 
-EN2130 Communication Design Project. GNU Radio 3.10 (radioconda, Windows) BPSK modem,
-Selective Repeat ARQ transport, Tkinter app with chat, photos, audio, files and a
-**4 in a Row** game played over the radio link.
+EN2130 Communication Design Project. Two PCs, one ANTSDR E200 each, BPSK FDD at 3300 / 3375 MHz.
+**Main use:** sending files and folders from one PC to the other over the radio, encrypted,
+checked on arrival, and continuing by themselves after a link drop. **Alongside:** messages
+(text, photos, files) and 4 in a Row.
 
-Built on Claude_3: the same modem blocks, framer, look-ahead AGC and transport. The main
-change fixes the slow direction seen in FDD at 3.3 / 3.375 GHz (~100 KB/s one way, ~8 KB/s
-the other).
+Built on the v5.3 engine: quiet FDD, Selective Repeat ARQ, CPU-light radio, `lean` profile and
+the radio watchdog. Still BPSK only.
 
 ```
- app.py / cli.py ─► transport.py (SR-ARQ, SACK, pacing, link quality) ─► UDP 52001 ─┐
-                        ▲  UDP 52002                                                │
- phy_flowgraph.py / grc: Framer ─► Chunks→Symbols ─► RRC ─► Pluto Sink    (TX F1 on node 1)
-                         Pluto Source ─► AGC ─► RRC ─► Symbol Sync ─► Costas ─► Decoder
-                         ─► Diff Dec ─► Correlate AC ─► Repack ─► Descramble ─► CRC32  (RX F2)
+ PC 1 (node 1)                                                     PC 2 (node 2)
+ app: Files · Messages · 4 in a Row · hidden radio-link panel      (the same app)
+   files.py   512 KB blocks, SHA-256 per file, continue after drops
+   core.py    radio + watchdog, outbox, telemetry (1 s CSV)
+   transport  SR-ARQ (SACK, pacing, quiet FDD), every frame AES-256-GCM with addresses
+   phy        framer ─ BPSK ─ E200    TX F1 3300 MHz  ───────────►  RX F1
+                                      RX F2 3375 MHz  ◄───────────  TX F2
 ```
-Node 2 uses the opposite frequencies (TX F2, RX F1).
 
-## 0. v5.3: warning, link drops, game delay
+## 1. Install and start (each PC)
 
-**Seen on air with v5.1:** both directions work (80+ KB/s), but:
-* the radio line sometimes turns red: *transmitter 0.96× real time – this PC can't keep up*;
-* sometimes the link drops and doesn't come back until the app is restarted;
-* game moves sometimes arrive much later than the link speed suggests.
+1. **Hardware:** connect the E200 by Ethernet, with the PC adapter set to `192.168.1.100 /
+   255.255.255.0`.
+2. **Copy the files:** put the `sdr_link_v7` folder on the PC.
+3. **Run `Setup.bat` once.** It picks the Python to use, in this order:
+   * your **own conda environment**, if you run `Setup.bat` from *Anaconda Prompt* after
+     `conda activate <env>` and that environment has GNU Radio;
+   * otherwise **radioconda**;
+   * otherwise any Anaconda / Miniconda / Miniforge environment that has GNU Radio.
 
-**The red warning** fired at anything under 0.97×. Short dips to 0.95× are normal Windows
-timing jitter and cost nothing. It now turns red only below 0.90×, on overflows or
-underflows, or when the TX queue passes 60 frames. A *steady* transmitter below 1.00×
-still means the PC ↔ E200 link is too slow: use `--profile lean` on both PCs (section 1).
+   It then adds the one missing package (`cryptography`) without touching numpy, Qt or GNU
+   Radio, checks the E200, and puts an **SDR Link** shortcut on the desktop.
+4. **Double-click `SDR Link.exe`.** The first start asks:
+   * **Which node is this PC?** Make one PC node 1 and the other node 2.
+   * **Pair the two PCs.** On one PC choose *Create a new pairing key* and *Save a copy for
+     the other PC…* (a USB stick is fine). On the other PC choose *Load the key from the other
+     PC…*. Both show the same **pairing code**.
+5. **Wait for the link.** The radio starts by itself, and the link connects as soon as both
+   PCs run.
 
-**Link drops that don't recover.** The radio process can stall or die (a USB / Ethernet
-hiccup to the E200, Windows suspending the adapter, a gr-iio buffer error). v5.1 then sat
-there with the link down. v5.3 has a **radio watchdog** in the app and in `cli.py`:
-* it restarts the radio when its process stops, when it stops reporting for 10 s, or when
-  the link has been down for 15 s after it had worked;
-* each further try waits longer (15 s, 30 s, … 2 min; back to 15 s after a minute of link
-  up), so a PC whose partner is simply switched off isn't restarted all the time;
-* F1 / F2 / TX atten / RX gain changed with **Apply** are kept across restarts;
-* the chat shows *radio restarted automatically: <reason>*.
+If Windows blocks the unsigned `.exe`, use `Start SDR Link (no exe).bat`; it does the same.
 
-**Game delay.** A move is a tiny transfer. In quiet FDD a frame sent alone after silence
-is decoded less reliably (about 3 in 4) than one right behind another, and a lost move
-waited for the retransmission timeout, which grows while a file is moving (up to 1–2 s).
-Moves also queued behind file data. v5.3:
-* chat lines and moves (≤ 480 bytes) use a **priority frame type** that the framer sends
-  ahead of file data;
-* each is sent **twice back to back** and resent after 1.5 round trips without an ACK;
-* they never wait for a file transfer slot.
+**With the GRC flowgraph instead of the built-in radio (viva):**
+1. Open `grc/sdr_link_phy_bpsk.grc`.
+2. Set `node`, `duplex`, `f1` and `f2` to match the app.
+3. Run it, then start `python app.py --no-radio`.
 
-Emulated link that loses 25 % of isolated frames, with a big file going the other way:
-move delay 90th percentile **1015 ms → 38 ms**, worst **2337 ms → 41 ms**.
+## 2. Using it
 
-**Transfer stability** (found while testing the above):
-* the delay-based speed valve could leave the sender stuck at 30 % speed: quiet-FDD ACKs
-  come every 32 KB, so at low speed they were seconds apart and the valve, which only
-  recovered when an ACK arrived, never got back up. It now measures queueing from the
-  *smallest* recent round trip (held-back ACKs don't count) and recovers by time;
-* in quiet FDD the retransmission timeout is never shorter than the gap between ACKs, so
-  frames are no longer resent while their ACK is simply not due yet.
+**Files (main page).**
+* **Sending:** drop files or folders on the window, or press **Ctrl+O** (files) or
+  **Ctrl+Shift+O** (a folder; it arrives as a `.zip`).
+* **On the way:** shows progress and time left, with **Cancel**. If the link drops, the
+  row says *Paused: link down*, and the file continues where it stopped when the link is
+  back. Nothing has to be resent from the start.
+* **Earlier:** every file sent or received is listed. *Delivered, verified* means the
+  receiver's SHA-256 matched. There are **Open**, **Show in folder** and **Send again**
+  buttons.
+* **Where files go:** `data\received` (change it in Settings).
+* **No link for a while:** a card says why, in plain words. For example: nothing heard from
+  the other PC, lost contact, a different pairing key, or this PC's radio not running.
 
-Result through the GNU Radio modem, both directions at once (quiet FDD): forward transfer
-**18–20 → 27 KB/s** of 31.2 raw at the sim rate; emulated ARQ test **88 % → 92 %** of the raw
-rate (115 KB/s).
+**Messages:** text with a ✓ when delivered. Attach photos or files with the paper clip
+(**Ctrl+Shift+A**); photos show in the chat.
 
-## 1. v5.1: a PC whose transmitter can't keep up
+**4 in a Row:** **Ctrl+N** starts a new game, and **1–7** or a click drops a disc.
+
+**Settings:**
+* node number (with *Switch to node 1/2*);
+* pairing code, and saving or loading the key;
+* the folder for received files.
+
+**Everywhere:** **Ctrl+1…4** switch pages, **F1** lists every shortcut, **F11** switches to
+full screen.
+
+## 3. The hidden radio-link panel: Ctrl+Shift+D
+
+Nothing about the radio appears on the normal screens. Everything is here, over the middle of
+the window (**Esc** closes it).
+
+| tab | what it shows |
+|---|---|
+| **Overview** | **Node:** both addresses, pairing code. **Radio:** TX / RX frequency, modulation (BPSK, sample rate, samples per symbol, bit rate), RF bandwidth, duplex (and burst + listen mode), TX attenuation / RX gain, receiver and transmitter speed (× real time), TX queue, dropped frames, overflows / underflows, automatic restarts. **Link:** state, round trip (beacon, data, minimum, timeout), speed in and out (file data and on the air), pacing rate and queueing delay, frames getting through each way, first-try delivery, frame payload size, frames per second, totals (resent, timeouts, duplicates), rejected frames by reason. |
+| **Graphs** | last 5 minutes, once a second: speed (data and on the air, each way), round trip, frames getting through each way, radio speed |
+| **Transfers** | every file (size, seconds, KB/s, radio frames, frames resent, blocks sent again, result) and every radio transfer underneath (file blocks, messages, game moves) |
+| **Log** | link, radio and transfer events. **All the numbers above are also saved every second** to `data\telemetry\<date>_node<N>.csv` (40 columns, opens in Excel) for your report. |
+| **Radio** | F1 / F2 / TX attenuation / RX gain, applied live; profile and duplex for the next start; restart this PC's radio |
+
+## 4. Requirements and where they are met
+
+| requirement | how |
+|---|---|
+| Unique addressing | Each node has a random 32-bit address from the pairing. Every frame carries destination and source addresses in its authenticated header. Frames from any other address are dropped and counted. |
+| Encryption of everything | AES-256-GCM on every frame: file data, ACKs, beacons, messages, game moves. Replay protection uses a per-frame counter and a saved start epoch (section 5). |
+| Application | File transfer: files and folders, any size, SHA-256 per file, cancel, history, continues after link drops. Messages and 4 in a Row alongside. |
+| Link back up automatically | The app starts the radio itself. The watchdog restarts it when the process dies, stops reporting, or the link stays down after it had worked. Transfers wait out a drop and continue with the missing frames. |
+| Double-click executable | `SDR Link.exe` finds the right Python (`Setup.bat` notes it) and starts the app with no console window. It shows a clear message if something is missing. |
+| Telecom details hidden but complete | The hidden panel (section 3) plus the 1-second telemetry CSV |
+| Clear, modern UI | Files page with drag and drop, plain-language status, shortcuts for everything |
+| BPSK only | unchanged radio |
+
+## 5. How it works
+
+**Encryption and addressing.**
+```
+on the air:  A5 | type | dst addr(4) | src addr(4) | epoch(4) | counter(4) | AES-GCM(frame) | tag(16)
+```
+* The key and both addresses come from `data\pairing.key`. The app never shows the key; the
+  pairing code is a short hash that both PCs show for comparison.
+* **Nonce:** source address | epoch | counter, which never repeats.
+* **Receiver checks:** addresses, then the tag, then that the frame is new (a 4096-frame
+  window; older start epochs are rejected). A recorded frame played back is dropped, also
+  after a restart.
+* **Cost:** 32 bytes per frame. File transfer measured about 105–108 KB/s with encryption on.
+
+**File transfer (`files.py`).**
+* **Blocks:** a file goes as 512 KB blocks, each one verified transfer, two on the air at a
+  time, so the link stays full between blocks.
+* **Offer first:** the receiver learns the name, size and SHA-256 before the blocks arrive,
+  and writes them into a `.part` file. When everything is there it checks the SHA-256, saves
+  the file and replies *done*.
+* **Link drop:** the transport stops sending while it hears nothing (sending would only be
+  lost) and keeps its transfers. When the link is back it sends only the missing frames.
+  Measured: 4 MB file, link cut for 25 s at 35 %, finished with 1.09× the frames of one copy.
+* **Restart mid-file:** if the receiving app was restarted, it picks the file up from its
+  saved state.
+
+**Transport changes since v5.3:**
+* no sending while the link is down;
+* the give-up clock only runs while the link is up;
+* a drop does not count as a lossy link (frame size stays at 977 bytes);
+* the ACK clocks restart when the link comes back.
+
+## 6. Test results (no radios; `python tests/<name>.py`)
+
+| test | result |
+|---|---|
+| `files_test.py`: 5 items (text, empty file, photo, 3 MB, a folder), link cut mid-file for 25 s, cancel; encrypted, 2 % frame loss | PASS. 3 MB at **104 KB/s** of 125 raw. After the drop the file continued with 0 blocks resent (1.09× frames). Cancel removes the partial file at the receiver. |
+| `secure_test.py`: encryption, tampering, wrong key, replay (also after restarts) | PASS. 1 MB + 0.5 MB both ways at 108 KB/s; 20 replayed frames all rejected |
+| `e2e_sim_test.py`: through the **real GNU Radio modem**, encrypted, files both ways + messages | PASS. 0 rejected frames, messages 94 ms median (sim at ¼ of the hardware rate) |
+| `arq_emulated_test.py` | PASS, 116 KB/s (4 MB) with 115 KB/s the other way at the same time |
+| `deaf_emulated_test.py` | PASS, quiet FDD 101–116 KB/s both ways with a self-deafening radio |
+| `phy_burst_test.py`, `phy_per_test.py`, `game_test.py`, `watchdog_test.py` | PASS |
+| CLI over the emulated link | 1.4 MB file at 107 KB/s, byte-identical |
+
+Not run here: the `.exe` and `.bat` files on Windows, and the real E200s.
+
+## 7. Troubleshooting
+
+| what you see | what to do |
+|---|---|
+| *Nothing heard from the other PC yet* | Is SDR Link running on the other PC? Is one PC node 1 and the other node 2 (Settings)? Same pairing code? Then Ctrl+Shift+D on both: same F1 / F2, profile and duplex; *Radio health* should read about 1.00× |
+| *The other PC uses a different pairing key* | Settings: save the key on one PC, load it on the other |
+| *This PC's radio isn't running* | E200 plugged in and switched on? Ctrl+Shift+D → Log shows why (for example *Unable to create buffer*: another program holds the E200) |
+| Radio health red: *transmitter below 1.00×* | Ctrl+Shift+D → Radio → profile `lean` on both PCs, save, restart both apps |
+| One direction slow | Ctrl+Shift+D → Overview: *frames getting through*. Raise TX attenuation on the radio that receives badly, separate the antennas (appendix A) |
+| *radioconda was not found* / *The app stopped at start* | Run `Setup.bat` (from Anaconda Prompt with your environment active, if you use your own); details in `data\error.log` |
+
+## 8. Files
+
+```
+SDR Link.exe, Setup.bat   start / one-time setup (launcher source in tools/launcher/)
+app.py, ui/               the app (Qt): files, messages, game, settings, hidden radio-link panel
+files.py                  file transfer (blocks, SHA-256, continue after drops, history)
+core.py                   link engine: radio + watchdog, outbox, settings, telemetry
+secure.py                 pairing, addresses, AES-256-GCM, replay protection
+transport.py              SR-ARQ transport
+radio.py, phy/, grc/      the BPSK radio (GNU Radio)
+cli.py                    headless: listen / text / send / bench, same key and link as the app
+connect4.py, media.py     game rules, file kinds
+data/                     made at first start: key, settings, received files, transfers.jsonl, telemetry/
+tests/, tools/            tests above; tools/fake_radio.py runs both nodes on one PC
+```
+
+---
+
+# Appendix: the radio and transport layers (from v5.x)
+
+## A. The one-slow-direction problem and quiet FDD
+
+**A second possible cause.** In the old FDD mode each radio transmits *all the time*: when it has nothing to
+send, it sends idle symbols. If one E200's own transmitter leaks into its receiver
+(self-desensitisation; the README of the 2-node link already saw this on one board),
+that radio is partly deaf **all the time**. Data *into* it crawls; data *out of* it is fine,
+because the few ACKs that get through are enough. This reproduces the symptom: with
+radio 2 losing 75 % of the frames that arrive while it transmits, the old mode gives
+22 KB/s into radio 2 and 109 KB/s out of it.
+
+**Fix: quiet FDD (`--duplex fdd`, now the default).** Both directions still work at the
+same time, but a radio is **silent when it has nothing to send**:
+
+* **Framer** (`phy/framer_block.py`):
+  * After a data frame it keeps sending idle symbols for 2048 symbols (2 ms), so
+    back-to-back frames still need only the 4-byte preamble.
+  * Then it goes silent. After an ACK or beacon it goes silent at once.
+  * A frame that starts after silence gets a 128-byte burst preamble, so the far
+    receiver re-locks. The preamble is 0x55 and then fixed pseudo-random bytes: in
+    simulation a long 0x55-only preamble let the timing loop settle half a symbol off,
+    and only about 50 % of frames sent alone after a silence decoded.
+* **Receiver ACKs less often.** It ACKs per 32 KB of data instead of every frame, plus a
+  double ACK when the sender pauses. A deaf receiver then loses few incoming frames to
+  its own ACKs.
+* **A sender that stops hearing ACKs** while it transmits (it is the deaf one) switches
+  to "burst, then listen" for 15 s, so the ACKs reach it. The app tells you when this
+  happens.
+* **Both directions measured.** Every beacon carries frame counters, so both apps show
+  the share of frames getting through **to** and **from** the other node. A lossy
+  direction automatically gets shorter frames.
+
+**Results** (no radios; *emulated* = frame-level emulator, *modem sim* = the real GNU
+Radio modem with simulated air, CPU-limited on the test machine):
+
+| test | old continuous FDD | quiet FDD |
+|---|---|---|
+| emulated, radio 2 loses 75 % of frames while it transmits: into radio 2 / out of radio 2 | 22 / 109 KB/s | **103 / 117 KB/s** |
+| emulated, radio 2 completely deaf while it transmits | 0 / 0 (fails) | **99 / 102 KB/s** |
+| modem sim, radio 2 completely deaf (−4 dB SINR while it transmits) | fails both ways | 59 % / 44 % of raw rate |
+| modem sim, no deaf radio | 97 % / 76 % | 94 % / 97 % |
+| modem sim, both directions at once (raw 31 KB/s in the sim) | 29 / 29 KB/s | 29 / 28 KB/s |
+
+On your radios the problem is partial deafness (your slow direction still did 8 KB/s),
+which is the 75 % row. **This is not yet measured on the E200s.**
+
+If one direction is still slow on air:
+1. Look at "frames getting through" in the app (top bar) on both PCs.
+2. Raise **TX atten** on the radio that is slow to *receive*: its own transmitter
+   leaks less.
+3. Lower TX atten on the other radio.
+4. Separate the TX and RX antennas.
+5. Move F1 / F2 further apart.
+6. `--duplex tdd` is the fallback (slower: one direction at a time; 57–88 KB/s in your
+   earlier TDD test).
+
+
+## B. v5.1 and v5.2: a PC whose transmitter can't keep up
 
 **Seen on air with v5.0** (both PCs running `cli.py bench --mb 4` at the same time):
 * Node 2 → node 1: 3.8 MB at 113 KB/s.
@@ -124,165 +294,8 @@ Use the same profile on both PCs.
 the speed under Settings → Network → Ethernet → adapter properties ("Link speed
 1000/1000 Mbps"). A USB adapter should be USB 3 in a USB 3 port.
 
-## 2. The one-slow-direction problem and quiet FDD
 
-**A second possible cause.** In the old FDD mode each radio transmits *all the time*: when it has nothing to
-send, it sends idle symbols. If one E200's own transmitter leaks into its receiver
-(self-desensitisation; the README of the 2-node link already saw this on one board),
-that radio is partly deaf **all the time**. Data *into* it crawls; data *out of* it is fine,
-because the few ACKs that get through are enough. This reproduces the symptom: with
-radio 2 losing 75 % of the frames that arrive while it transmits, the old mode gives
-22 KB/s into radio 2 and 109 KB/s out of it.
-
-**Fix: quiet FDD (`--duplex fdd`, now the default).** Both directions still work at the
-same time, but a radio is **silent when it has nothing to send**:
-
-* **Framer** (`phy/framer_block.py`):
-  * After a data frame it keeps sending idle symbols for 2048 symbols (2 ms), so
-    back-to-back frames still need only the 4-byte preamble.
-  * Then it goes silent. After an ACK or beacon it goes silent at once.
-  * A frame that starts after silence gets a 128-byte burst preamble, so the far
-    receiver re-locks. The preamble is 0x55 and then fixed pseudo-random bytes: in
-    simulation a long 0x55-only preamble let the timing loop settle half a symbol off,
-    and only about 50 % of frames sent alone after a silence decoded.
-* **Receiver ACKs less often.** It ACKs per 32 KB of data instead of every frame, plus a
-  double ACK when the sender pauses. A deaf receiver then loses few incoming frames to
-  its own ACKs.
-* **A sender that stops hearing ACKs** while it transmits (it is the deaf one) switches
-  to "burst, then listen" for 15 s, so the ACKs reach it. The app tells you when this
-  happens.
-* **Both directions measured.** Every beacon carries frame counters, so both apps show
-  the share of frames getting through **to** and **from** the other node. A lossy
-  direction automatically gets shorter frames.
-
-**Results** (no radios; *emulated* = frame-level emulator, *modem sim* = the real GNU
-Radio modem with simulated air, CPU-limited on the test machine):
-
-| test | old continuous FDD | quiet FDD |
-|---|---|---|
-| emulated, radio 2 loses 75 % of frames while it transmits: into radio 2 / out of radio 2 | 22 / 109 KB/s | **103 / 117 KB/s** |
-| emulated, radio 2 completely deaf while it transmits | 0 / 0 (fails) | **99 / 102 KB/s** |
-| modem sim, radio 2 completely deaf (−4 dB SINR while it transmits) | fails both ways | 59 % / 44 % of raw rate |
-| modem sim, no deaf radio | 97 % / 76 % | 94 % / 97 % |
-| modem sim, both directions at once (raw 31 KB/s in the sim) | 29 / 29 KB/s | 29 / 28 KB/s |
-
-On your radios the problem is partial deafness (your slow direction still did 8 KB/s),
-which is the 75 % row. **This is not yet measured on the E200s.**
-
-If one direction is still slow on air:
-1. Look at "frames getting through" in the app (top bar) on both PCs.
-2. Raise **TX atten** on the radio that is slow to *receive*: its own transmitter
-   leaks less.
-3. Lower TX atten on the other radio.
-4. Separate the TX and RX antennas.
-5. Move F1 / F2 further apart.
-6. `--duplex tdd` is the fallback (slower: one direction at a time; 57–88 KB/s in your
-   earlier TDD test).
-
-## 3. Quick start (two PCs, one E200 each)
-
-1. radioconda prompt, once per PC: `conda install pillow` (photo previews and
-   compression; Windows radioconda already has Tk). Then run
-   `python tools/speed_check.py` and look for `RESULT: OK`.
-2. E200 on Ethernet, PC adapter `192.168.1.100 / 255.255.255.0`, check with
-   `iio_info -u ip:192.168.1.10`.
-3. Copy this folder to both PCs, then:
-
-   | PC 1 | PC 2 |
-   |---|---|
-   | `python app.py --node 1 --start-phy` | `python app.py --node 2 --start-phy` |
-
-4. Wait for the green **Link up**, then chat, send photos/audio/files and play.
-
-**Frequencies.** Node 1 transmits on **F1** and listens on **F2**; node 2 does the opposite.
-Defaults: F1 3300 MHz, F2 3375 MHz.
-* To change them: edit **F1 MHz / F2 MHz** at the bottom of the app and press **Apply**
-  (the radio retunes at once), or start with `--f1 3300 --f2 3375`.
-* The choice is saved in `radio_settings.json`.
-* **Set the same F1 / F2 on both PCs.** Keep them at least 40 MHz apart (the app warns
-  below that).
-
-**Other options** (must match on both PCs):
-* `--profile robust` (default, 4 Msps, 1 Mbit/s), `lean` (2 Msps, the same 1 Mbit/s,
-  half the PC ↔ E200 traffic) or `balanced` (10 Msps, 2.5 Mbit/s, needs a fast PC and a
-  Gigabit link).
-* `--duplex fdd` (default), `fdd-cont` (the old continuous FDD) or `tdd`.
-
-**TX atten / RX gain** can be changed live (Apply).
-
-**The GRC flowgraph instead of the Python radio** (for the viva):
-1. Open `grc/sdr_link_phy_bpsk.grc`.
-2. Set `node`, and set `duplex`, `f1` and `f2` to the same values as the app.
-3. Run it (F6), then start `python app.py --node N` **without** `--start-phy`.
-
-## 4. Using the app
-
-* **Chat:**
-  * Type and press **Enter**. A ✓ appears when the other node has the message.
-  * Photos appear in the chat; click a photo or file name to open it.
-  * Received files are saved in `received/`.
-* **Files:** **Ctrl+I** photo, **Ctrl+U** audio, **Ctrl+O** any file. Files go lossless
-  unless you tick *Compress photos*. Every file is checked with SHA-256.
-* **4 in a Row** (right panel):
-  * **Ctrl+N** starts a game. The player who didn't start the last game moves first.
-  * Click a column, or press **1–7**. **Esc** leaves the message box first, so the
-    digits drop discs instead of typing.
-  * Node 1 is red, node 2 yellow. The score is kept for the session.
-  * Each move is one small verified transfer, sent as a priority frame (twice, ahead of
-    any file data), so it arrives in a few tens of ms. Moves carry a number, so a late or
-    repeated move can't confuse the boards. A move that can't be delivered is sent again
-    when the link is back.
-* **Top bar:**
-  * Link state and round-trip time.
-  * *frames getting through* to and from the other node (shown while there is traffic).
-  * *burst + listen mode* if this radio is deaf while it transmits.
-* **Bottom:**
-  * Transfers table.
-  * The radio line: *receiver N× real time* must stay ≈1.00, otherwise the PC is too
-    slow.
-  * F1, F2, TX atten and RX gain, with **Apply**.
-* **F5** starts or stops the radio. While it is on, the watchdog restarts it by itself if
-  it stalls or the link stays down (section 0); F5 off stops that too.
-
-**CLI** (benchmarks, demos):
-```
-python cli.py --node 2 --start-phy listen
-python cli.py --node 1 --start-phy text "hello"
-python cli.py --node 1 --start-phy send photo.png
-python cli.py --node 1 --start-phy bench --mb 4      # prints KB/s and frames getting through
-```
-Use `bench` once in each direction (node 1 → 2, then node 2 → 1) to compare them.
-
-**One PC, no radios:** `python tools/fake_radio.py`, then `python app.py --node 1 --same-pc`
-and `python app.py --node 2 --same-pc`.
-
-## 5. Tests (no radios needed)
-
-| command | what it shows |
-|---|---|
-| `python tests/deaf_emulated_test.py` | the slow-direction problem and the fix, all three modes, both directions |
-| `python tests/deaf_sim_test.py` | the same through the real GNU Radio modem (`--deaf-node 0` = no deaf radio) |
-| `python tests/e2e_sim_test.py --duplex fdd` | text + files both ways at once through the modem, SHA-256 checked |
-| `python tests/phy_per_test.py` | frame error rate vs SNR (BPSK, back-to-back frames) |
-| `python tests/phy_burst_test.py` | frames after silence (quiet FDD and TDD) |
-| `python tests/arq_emulated_test.py` | ARQ with 2 % loss + bursts, 4 MB + 1 MB at the same time |
-| `python tools/speed_check.py` | this PC runs receive + transmit fast enough (want 1.5× real time or better) |
-| `python tests/game_test.py` | 4 in a Row rules and protocol (reordering, duplicates, simultaneous new game) |
-| `python tests/watchdog_test.py` | radio watchdog: restarts a dead / silent radio and a lost link, leaves a stopped one alone (~1 min) |
-
-Last run on the test machine (GNU Radio 3.10.9, v5.3):
-* All PASS.
-* Back-to-back frames: 299/300 down to 8 dB. The one lost is the very first frame after
-  the radio starts, while the AGC's averaging window fills.
-* Bursts: quiet FDD 96–100 % from 20 down to 8 dB; TDD 95–98 %.
-* ARQ: 92 % of the raw rate (115 KB/s of 4 MB, 112 KB/s the other way at the same time).
-* Both directions at once through the modem: 94–97 % of the raw rate each.
-* `e2e_sim_test.py --duplex tdd` passes most runs but now and then fails on the 2-core
-  test machine (the TDD turn-taking in the simulated modem is CPU-sensitive). v5.2 does
-  the same (1 of 4 runs), so it is the test box, not v5.3.
-* speed_check: 3.20× real time.
-
-## 6. Review of the original flowgraph: what changed and why
+## C. Review of the original flowgraph: what changed and why
 
 | block / setting | problem | change |
 |---|---|---|
@@ -299,7 +312,8 @@ Last run on the test machine (GNU Radio 3.10.9, v5.3):
 | Polyphase Arbitrary Resampler (TX RRC, ×4) | Most expensive block (8.5 Msps); a slower PC's transmitter fell behind real time | **Interpolating FIR Filter**, same RRC pulse (51.6 Msps) |
 | Python look-ahead AGC | Shares the Python lock with the Python framer | **Same AGC from C++ blocks** |
 
-## 7. Transport protocol (Selective Repeat ARQ)
+
+## D. Transport protocol (Selective Repeat ARQ)
 
 ```
 DATA : A5 | 01 | src | dst | xfer(2) | seq(4) | total(4) | txn(1) | up to 1009 bytes
@@ -321,35 +335,3 @@ audio, file, game.
   photo.
 * **Quiet-FDD additions:** see section 2.
 
-## 8. Troubleshooting
-
-| symptom | check |
-|---|---|
-| One direction much slower than the other | Section 2: compare *frames getting through*, raise TX atten on the radio that receives badly, separate its antennas, or try `--duplex tdd` |
-| *Link up*, then *Link down* after a few seconds | The same self-deafening, stronger: as above |
-| One node *Link down*, the other *One-way* | The path into the *Link down* node is broken: antennas, TX atten 0 on the other node, RX gain 40–60 |
-| Link never comes up | Same profile, duplex, F1 / F2 and node numbers 1 and 2? `iio_info` works? Run `python phy/phy_flowgraph.py --node N --gui` and look for a clean 2-point constellation |
-| One direction fails while *that sender's* TX queue keeps growing, or *transmitter below 1.00×* / underflows | If `tools/speed_check.py` says OK on that PC, its link to the E200 is too slow: use `--profile lean` on both PCs, or a Gigabit / USB 3 connection (section 1). Otherwise: charger, Best performance, close other programs, no `--gui` |
-| *receiver below 1.00× real time* or overflows | PC too slow: plug in the charger, close other programs, don't use `--gui`, use `robust` |
-| Chat shows *radio restarted automatically* now and then | The radio stalled (process stopped / no reports) or the link stayed down; the watchdog brought it back. Often: check the Ethernet cable / adapter to the E200, and set Windows *Power options → USB selective suspend* and the adapter's *Allow the computer to turn off this device* off |
-| Radio line red with *transmitter* between 0.90 and 1.00× all the time | PC ↔ E200 link a bit too slow: `--profile lean` on both PCs |
-| "Unable to create buffer" | Another program holds the E200 (GRC, an old window): close it |
-
-## 9. Files
-
-```
-app.py               messenger + 4 in a Row (Tk)
-connect4.py          game rules and its radio protocol
-cli.py               headless send / listen / bench
-transport.py         SR-ARQ transport, quiet-FDD ACK policy, listen mode, link quality
-radio.py             starts / stops the radio process, health line, live RF control
-config.py            profiles, duplex modes, frequencies (radio_settings.json), framing
-media.py             file types, save, open, photo compression
-phy/phy_flowgraph.py the radio (hardware, or --sim both nodes, --sim-deaf to test self-deafening)
-phy/framer_block.py  TX framer (embedded in the .grc too)
-phy/agc_block.py     look-ahead AGC (embedded in the .grc too)
-grc/                 GRC flowgraphs (tools/make_grc.py regenerates them)
-tools/fake_radio.py  emulated link for one PC
-tools/speed_check.py can this PC run the radio (receive + transmit at once)?
-tests/               see section 5
-```

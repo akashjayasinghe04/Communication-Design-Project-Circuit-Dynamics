@@ -33,6 +33,9 @@ class Radio:
         self.down_since = None
         self.up_since = None
         self.backoff = 15.0
+        self.fails = 0                   # radio processes in a row that died within 30 s
+        self.t_died = None
+        self.restarts = 0
         self.pidfile = os.path.join(HERE, f".radio_node{node}.pid")
 
     @property
@@ -163,6 +166,13 @@ class Radio:
             return None
         why = None
         if not self.running:
+            # a radio that keeps dying at once (E200 unplugged, busy): wait longer each time
+            if self.t_died is None:
+                self.t_died = now
+                self.fails = self.fails + 1 if now - self.t_start < 30 else 0
+            if now - self.t_died < min(60.0, 2.0 * 2 ** self.fails) - 2.0:
+                return None
+            self.t_died = None
             why = "the radio process stopped"
         elif now - self.t_health > 10 and now - self.t_start > 15:
             why = "the radio stopped reporting for 10 s"
@@ -172,6 +182,7 @@ class Radio:
             self.backoff = min(120.0, self.backoff * 2)
         if why is None:
             return None
+        self.restarts += 1
         self.stop(by_user=False)
         self.start(*self.settings)
         self.down_since = now if not link_up and self.link_seen else None

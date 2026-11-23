@@ -4,6 +4,9 @@ AWGN + carrier offset + clock offset) <-> UDP <-> transport.py.
 
     python tests/e2e_sim_test.py --profile robust --sim-rate 2e6 --snr 15 --size 0.3
 
+Every frame encrypted (AES-GCM, as in the app; --plain turns it off), plus small messages from
+node 2 during the transfers, whose delivery time is reported.
+
 Sim rate is limited by your CPU (two complete modems run in one process).
 """
 import argparse
@@ -16,6 +19,7 @@ import time
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, ROOT)
 import config  # noqa: E402
+import secure  # noqa: E402
 from transport import Transport  # noqa: E402
 
 
@@ -27,6 +31,7 @@ def main():
     ap.add_argument("--size", type=float, default=0.3, help="MB file node1 -> node2")
     ap.add_argument("--python", default=sys.executable, help="python with GNU Radio")
     ap.add_argument("--duplex", default=config.DEFAULT_DUPLEX, choices=config.DUPLEX_MODES)
+    ap.add_argument("--plain", action="store_true", help="no encryption")
     a = ap.parse_args()
     prof = config.PROFILES[a.profile]
     rate = config.PhyRate(a.sim_rate, prof["sps"], prof["mod"])
@@ -42,11 +47,15 @@ def main():
 
     def mk(n):
         def on(e):
+            e["_t"] = time.time()             # when it arrived (the loop below polls slowly)
             with lock:
                 events.append((n, e))
         return on
-    n1 = Transport(1, 2, 52001, 52002, rate, mk("n1"), duplex=a.duplex)
-    n2 = Transport(2, 1, 52011, 52012, rate, mk("n2"), duplex=a.duplex)
+    P = secure.new_pairing()
+    c1 = None if a.plain else secure.LinkCrypto(P, 1)
+    c2 = None if a.plain else secure.LinkCrypto(P, 2)
+    n1 = Transport(1, 2, 52001, 52002, rate, mk("n1"), duplex=a.duplex, crypto=c1)
+    n2 = Transport(2, 1, 52011, 52012, rate, mk("n2"), duplex=a.duplex, crypto=c2)
     n1.start(); n2.start()
     t = time.time()
     while time.time() - t < 10 and not (n1.link_up and n2.link_up):
@@ -58,6 +67,15 @@ def main():
         n2.send_bytes(os.urandom(int(a.size * 0.5e6)), {"kind": "file", "name": "rev.bin"}): ("n1", None),
     }
     sizes = {x: int(a.size * 1e6) for x in list(payloads)[1:2]}
+    running = [True]
+    small = {}                            # xfer -> send time (node 2 -> node 1 commands)
+
+    def commander():
+        while running[0]:
+            time.sleep(0.7)
+            small[n2.send_bytes(b'{"text":"hi"}', {"kind": "chat"})] = time.time()
+    threading.Thread(target=commander, daemon=True).start()
+    small_lat = []
     t0 = time.time()
     ok = True
     pending = set(payloads)
@@ -65,6 +83,11 @@ def main():
         time.sleep(0.3)
         with lock:
             for n, e in events:
+                if e["type"] == "rx_done" and n == "n1" and e["meta"].get("kind") == "chat":
+                    t_s = small.pop(e["xfer"], None)
+                    if t_s:
+                        small_lat.append(e["_t"] - t_s)
+                    continue
                 if e["type"] == "rx_done" and e["xfer"] in pending and payloads[e["xfer"]][0] == n:
                     exp = payloads[e["xfer"]][1]
                     good = e["ok"] and (exp is None or e["data"] == exp)
@@ -75,8 +98,15 @@ def main():
                 if e["type"] == "tx_failed":
                     print("TX FAILED", e); ok = False; pending.clear()
             events.clear()
+    running[0] = False
     if pending:
         print("TIMEOUT waiting for", pending); ok = False
+    if small_lat:
+        L = sorted(small_lat)
+        print(f"commands node2->node1 during the transfers: {len(L)}, median {1000 * L[len(L) // 2]:.0f} ms, "
+              f"worst {1000 * L[-1]:.0f} ms")
+    if c2 is not None:
+        print(f"encryption on: rejected frames node1 {c1.stats['rejected']} node2 {c2.stats['rejected']}")
     print(f"PHY raw rate in this sim: {rate.byte_rate/1e3:.1f} KB/s; node1 srtt="
           f"{(n1.srtt or 0)*1000:.0f} ms; node1 stats {dict(n1.stats)}")
     print(f"rate ctl: n1 rate={n1._rate:.0f}/{n1._rate_max:.0f} B/s min_rtt={n1.min_rtt*1000:.0f}ms srtt={(n1.srtt or 0)*1000:.0f}ms")

@@ -10,14 +10,14 @@ Throughput (raw PHY bit rate) = samp_rate / sps   (BPSK, 1 bit per symbol)
   lean        2 Msps    2   1.0 Mbps   ~110 KB/s   (same signal as robust, half the PC <-> E200 traffic)
 
 Frequencies: node 1 transmits on F1 and listens on F2; node 2 does the opposite.
-Defaults F1 = 3300 MHz, F2 = 3375 MHz. Change them in the app (F1 / F2 + Apply) or with
---f1 / --f2 (MHz); the choice is saved in radio_settings.json next to this file.
+Defaults F1 = 3300 MHz, F2 = 3375 MHz. Change them in the app's hidden radio panel
+(Ctrl+Shift+D) or with cli.py --f1 / --f2 (MHz); saved in data/settings.json.
 """
 import json
 import os
 from dataclasses import dataclass
 
-VERSION = "5.3"
+VERSION = "7.0"
 
 PROFILES = {
     "robust":   dict(samp_rate=4_000_000,  sps=4, mod="bpsk"),
@@ -43,7 +43,9 @@ DEFAULT_DUPLEX = "fdd"
 F1_DEFAULT = 3_300_000_000       # node 1 TX  /  node 2 RX
 F2_DEFAULT = 3_375_000_000       # node 2 TX  /  node 1 RX
 FREQ_MIN, FREQ_MAX = 70_000_000, 6_000_000_000
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "radio_settings.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(HERE, "data")       # pairing key, settings, telemetry, received files
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")   # shared with the app (core.Settings)
 
 NODES = {
     1: dict(uri="ip:192.168.1.10", tx_port=52001, rx_port=52002, ctrl_port=52003),
@@ -79,8 +81,15 @@ def load_freqs():
 
 
 def save_freqs(f1, f2):
+    try:
+        with open(SETTINGS_FILE) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    d.update(f1_mhz=f1 / 1e6, f2_mhz=f2 / 1e6)
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(SETTINGS_FILE, "w") as f:
-        json.dump({"f1_mhz": f1 / 1e6, "f2_mhz": f2 / 1e6}, f)
+        json.dump(d, f, indent=1)
 
 
 def freqs_from_args(f1_mhz, f2_mhz):

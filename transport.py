@@ -81,7 +81,9 @@ HELLO = struct.Struct(">BBBBHdddIH")
 CANCEL = struct.Struct(">BBBBH")
 COMMON = struct.Struct(">BBBBH")
 
-CHUNK = config.PHY_MTU - DATA_HDR.size     # 1009 bytes of file per frame (largest)
+SEC_OVERHEAD = 32       # secure.OVERHEAD: address/counter header + AES-GCM tag on every frame
+CHUNK = config.PHY_MTU - DATA_HDR.size - SEC_OVERHEAD   # 977 bytes of file per frame (largest)
+
 CHUNKS = ((0.90, CHUNK), (0.70, 500), (0.0, 240))   # frame size by delivery ratio of the direction
 BITMAP_BYTES = 64                          # SACK window: 512 frames beyond cum
 FLAG_COMPLETE = 0x01
@@ -134,6 +136,8 @@ class TxTransfer:
         self.t_progress = _now()
         self.frames_sent = 0
         self.retransmissions = 0
+        self.last_newly = 0
+        self.saw_drop = False
         self.done = False
         self.failed = None
 
@@ -193,6 +197,7 @@ class TxTransfer:
                         newly.append(s)
         while self.cum < self.total and self.acked[self.cum]:
             self.cum += 1
+        self.last_newly = len(newly)
         if newly:
             self.n_acked += len(newly)
             self.t_progress = now
@@ -292,8 +297,9 @@ class Transport:
     """
 
     def __init__(self, node_id, peer_id, tx_port, rx_port, phy_rate, on_event=None,
-                 params=None, host="127.0.0.1", duplex="fdd"):
+                 params=None, host="127.0.0.1", duplex="fdd", crypto=None):
         self.me, self.peer = node_id, peer_id
+        self.crypto = crypto               # secure.LinkCrypto: every frame sealed / opened
         self.mode = duplex
         self.tdd = (duplex == "tdd")
         self.quiet = (duplex == "fdd")
@@ -437,6 +443,16 @@ class Transport:
         """share of our frames that reach the peer (its report), or None."""
         return self.quality_out if _now() - self._q_out_t < 6.0 else None
 
+    def telemetry(self):
+        """the transport's live numbers for the hidden telecom panel."""
+        return dict(state=self.link_state, beacon_rtt=self.current_rtt, srtt=self.srtt,
+                    min_rtt=None if self.min_rtt > 1e8 else self.min_rtt, rto=self.rto * self._rto_backoff,
+                    rate=self._rate, rate_max=self._rate_max, queue_delay=self._qd,
+                    chunk=self.chunk_size(), first_try=self._data_delivery,
+                    q_out=self.current_quality_out, q_in=self.current_quality_in,
+                    listen_mode=self.listen_mode, active_tx=len(self._active), pending_tx=len(self._pending),
+                    active_rx=len(self._rx), duplex=self.mode)
+
     @property
     def listen_mode(self):
         return self.quiet and _now() < self._hybrid_until
@@ -463,6 +479,8 @@ class Transport:
             print("event handler error:", ex, file=sys.stderr)
 
     def _send(self, frame, ctrl=False):
+        if self.crypto is not None:
+            frame = self.crypto.seal(frame)
         try:
             self.sock.sendto(frame, self.tx_addr)
         except (BlockingIOError, OSError) as ex:
@@ -471,6 +489,7 @@ class Transport:
                 print("send error:", ex, file=sys.stderr)
             return False
         self._tokens -= len(frame) + config.PHY_OVERHEAD
+        self.stats["tx_bytes"] += len(frame)
         self.stats["tx_ctrl" if ctrl else "tx_data"] += 1
         self._sent_frames += 1
         return True
@@ -528,6 +547,12 @@ class Transport:
         self._rx_frames += 1
         if not self._link_up:
             self._link_up = True
+            # back after a drop: start the ACK clocks afresh (the silence was the drop, not a
+            # deaf receiver or a congested link)
+            self._last_ack_rx = now
+            self._sending_since = None
+            self._rto_backoff = 1.0
+            self._hybrid_until = 0.0
             self._emit(type="link", up=True)
         if typ in (T_DATA, T_DATA_P) and len(pkt) >= DATA_HDR.size:
             self._on_data(pkt, src, xfer, now)
@@ -570,6 +595,7 @@ class Transport:
             self._rx[key] = rx
             self._emit(type="rx_start", xfer=xfer, src=src, total=total)
         is_new = rx.add(seq, bytes(pkt[DATA_HDR.size:]))
+        self.stats["rx_new_bytes" if is_new else "rx_dup"] += (len(pkt) - DATA_HDR.size) if is_new else 1
         rx.echo = (seq, txn)
         rx.unacked += 1
         rx.unacked_bytes += len(pkt) - DATA_HDR.size
@@ -642,6 +668,7 @@ class Transport:
                 if flags & FLAG_COMPLETE:
                     cum, bitmap = t.total, b""
                 rtt = t.on_ack(cum, bitmap, echo_seq, echo_txn, now)
+                self.stats["acked_bytes"] += t.last_newly * t.chunk_size
                 if rtt is not None:
                     self._update_rtt(rtt)
                 if t.done:
@@ -658,7 +685,8 @@ class Transport:
 
     def _finish_tx(self, t, now):
         dt = max(1e-6, now - (t.t_start or now))
-        if t.total >= 20:                  # enough frames to judge this direction
+        if t.total >= 20 and not t.saw_drop:   # enough frames to judge this direction (frames lost
+                                               # to a link drop say nothing about it)
             first_try = max(0.0, 1.0 - t.retransmissions / max(1, t.frames_sent))
             d = self._data_delivery
             self._data_delivery = first_try if d is None else 0.5 * d + 0.5 * first_try
@@ -697,11 +725,18 @@ class Transport:
                     keep.append((xid, body, meta))
             self._pending = keep
         for t in list(self._active):
+            if not self._link_up:
+                t.saw_drop = True
+                t.t_progress = now         # the give-up clock runs only while the link is up: a
+                                           # transfer waits out a link drop and then continues
             if t.failed:
                 self._active.remove(t)
                 self._emit(type="tx_failed", xfer=t.xfer, meta=t.meta, reason=t.failed)
             elif t.t_start and now - t.t_progress > self.p.stall_timeout:
                 t.failed = "no ACK progress (link down?)"
+        if not self._link_up:
+            return          # nothing heard from the peer: frames sent now would be lost; the
+                            # transfers wait and continue with the missing frames when it is back
         # retransmission timeouts
         rto = self.rto * self._rto_backoff
         if self.quiet:
@@ -759,6 +794,8 @@ class Transport:
                 txn = t.tx_count[s] % 255 + 1
                 frame = DATA_HDR.pack(MAGIC, T_DATA, self.me, t.dst, t.xfer, s, t.total, txn) + t.chunk(s)
                 if self._send(frame):
+                    if t.tx_count[s]:
+                        self.stats["retx"] += 1
                     t.mark_sent(s, now)
                     self._last_data_tx = now
                     if bursty:
@@ -902,6 +939,11 @@ class Transport:
                         continue
                     except OSError:
                         break
+                    self.stats["rx_bytes"] += len(pkt)
+                    if self.crypto is not None:
+                        pkt = self.crypto.open(pkt)
+                        if pkt is None:
+                            continue
                     self._handle(pkt, now)
             try:
                 self._pump(now)
